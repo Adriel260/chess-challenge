@@ -1,0 +1,25 @@
+# Ambiente virtual do Python
+.venv/
+venv/
+
+# Arquivos temporarios do Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Configuracoes locais
+.vscode/
+.env
+.env.*
+
+# Motor instalado localmente
+engines/*
+!engines/.gitkeep
+
+# Registros das partidas
+logs/*
+!logs/.gitkeep
+
+# Arquivos do sistema
+Thumbs.db
+.DS_Store
