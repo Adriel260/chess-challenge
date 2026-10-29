@@ -6,6 +6,7 @@ Usar `chess.engine.SimpleEngine.popen_uci` e `analyse(..., multipv=N)` da python
 import chess
 
 from contratos import Orcamento, ResultadoBusca
+from motor.falso import MotorFalso
 
 
 class Motor:
