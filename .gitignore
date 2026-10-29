@@ -9,6 +9,7 @@ __pycache__/
 
 # Configuracoes locais
 .vscode/
+.claude/settings.local.json
 .env
 .env.*
 
