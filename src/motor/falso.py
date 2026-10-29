@@ -33,7 +33,7 @@ class MotorFalso:
         fen_atual = tabuleiro.fen()
         if fen_atual in self.candidatos_por_fen:
             return ResultadoBusca(
-                candidatos=self.candidatos_por_fen[fen_atual],
+                candidatos=list(self.candidatos_por_fen[fen_atual]),
                 tempo_gasto_s=0.01,
             )
 
@@ -63,5 +63,5 @@ class MotorFalso:
     def __enter__(self) -> "MotorFalso":
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+    def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> None:
         self.fechar()
