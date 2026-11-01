@@ -10,7 +10,7 @@ from contratos import EstadoRelogio
 
 
 def _validar_cor_e_relogio(minha_cor: object, relogio: object) -> None:
-    """Valida a cor e os tempos, exigindo milissegundos inteiros não negativos."""
+    """Valida os tipos da cor e dos campos do relógio."""
     if type(minha_cor) is not bool:
         raise ValueError("O campo 'minha_cor' deve ser um valor booleano.")
 
@@ -23,6 +23,12 @@ def _validar_cor_e_relogio(minha_cor: object, relogio: object) -> None:
             raise ValueError(
                 f"O campo 'relogio.{campo}' deve ser um número inteiro de milissegundos."
             )
+
+
+def _validar_relogio_nao_negativo(relogio: EstadoRelogio) -> None:
+    """Rejeita tempos negativos ao carregar um relógio persistido."""
+    for campo in ("meu_ms", "adversario_ms", "incremento_ms"):
+        valor = getattr(relogio, campo)
         if valor < 0:
             raise ValueError(
                 f"O campo 'relogio.{campo}' deve ser um valor não negativo."
@@ -39,20 +45,24 @@ class EstadoPartida:
         """Salva o estado em JSON atômico.
 
         Raises:
-            ValueError: se a cor ou os tempos forem inválidos.
+            ValueError: se a cor, os tempos ou a posição inicial forem inválidos.
             OSError: se não for possível gravar ou substituir o arquivo.
             Outras exceções da serialização: propagadas sem alteração.
         """
         _validar_cor_e_relogio(self.minha_cor, self.relogio)
 
+        tabuleiro_inicial = self.tabuleiro.root()
+        if not tabuleiro_inicial.is_valid():
+            raise ValueError("A posição inicial é inválida.")
+
         dados = {
-            "fen_inicial": self.tabuleiro.root().fen(),
+            "fen_inicial": tabuleiro_inicial.fen(),
             "lances_uci": [lance.uci() for lance in self.tabuleiro.move_stack],
             "minha_cor": self.minha_cor,
             "relogio": {
-                "meu_ms": self.relogio.meu_ms,
-                "adversario_ms": self.relogio.adversario_ms,
-                "incremento_ms": self.relogio.incremento_ms,
+                "meu_ms": max(0, self.relogio.meu_ms),
+                "adversario_ms": max(0, self.relogio.adversario_ms),
+                "incremento_ms": max(0, self.relogio.incremento_ms),
             },
         }
 
@@ -73,7 +83,12 @@ class EstadoPartida:
 
     @classmethod
     def carregar(cls, caminho: str) -> "EstadoPartida":
-        """Recupera a partida, preservando histórico, cor e relógio."""
+        """Recupera a partida, preservando histórico, cor e relógio.
+
+        Raises:
+            FileNotFoundError: se o arquivo não existir.
+            ValueError: se o arquivo não puder ser lido ou contiver dados inválidos.
+        """
         try:
             with open(caminho, "r", encoding="utf-8") as arquivo:
                 dados = json.load(arquivo)
@@ -135,6 +150,7 @@ class EstadoPartida:
                 ) from erro
 
             _validar_cor_e_relogio(minha_cor, relogio)
+            _validar_relogio_nao_negativo(relogio)
 
             try:
                 tabuleiro = chess.Board(fen_inicial)
@@ -164,7 +180,7 @@ class EstadoPartida:
 
         except (TypeError, ValueError) as erro:
             raise ValueError(
-                f"Arquivo de partida com dados inválidos: {erro}"
+                f"Arquivo de partida com dados inválidos ('{caminho}'): {erro}"
             ) from erro
 
         return cls(

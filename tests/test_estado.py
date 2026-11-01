@@ -64,6 +64,27 @@ def test_salvar_carregar_10_meios_lances(tmp_path):
     _assert_estado_equivalente(carregado, estado)
 
 
+def test_salvar_carregar_relogio_com_adversario_negativo(tmp_path):
+    """Grava zero para o adversário sem alterar o relógio original."""
+    caminho = tmp_path / "estado.json"
+    relogio = EstadoRelogio(
+        meu_ms=900000,
+        adversario_ms=-3000,
+        incremento_ms=10000,
+    )
+    estado = EstadoPartida(
+        tabuleiro=chess.Board(), minha_cor=chess.WHITE, relogio=relogio
+    )
+
+    estado.salvar(str(caminho))
+    carregado = EstadoPartida.carregar(str(caminho))
+
+    assert carregado.relogio.meu_ms == 900000
+    assert carregado.relogio.adversario_ms == 0
+    assert carregado.relogio.incremento_ms == 10000
+    assert estado.relogio.adversario_ms == -3000
+
+
 def test_lances_especiais_roque_en_passant_promocao(tmp_path):
     """Compara o estado completo após roque, en passant e promoção."""
     caminho = tmp_path / "estado.json"
@@ -184,7 +205,7 @@ def test_carregar_bytes_incompativeis_com_utf8(tmp_path):
     caminho = tmp_path / "codificacao-invalida.json"
     caminho.write_bytes(b"\xff\xfe\xfa")
 
-    with pytest.raises(ValueError, match=r"(?i)utf-8"):
+    with pytest.raises(ValueError, match=r"(?i)codificação UTF-8 inválida"):
         EstadoPartida.carregar(str(caminho))
 
 
@@ -254,6 +275,18 @@ def test_carregar_minha_cor_com_tipo_invalido(tmp_path, minha_cor):
         EstadoPartida.carregar(str(caminho))
 
 
+@pytest.mark.parametrize("fen_inicial", [123, None, [], {}])
+def test_carregar_fen_inicial_com_tipo_invalido(tmp_path, fen_inicial):
+    caminho, dados = _criar_json_valido(tmp_path)
+    dados["fen_inicial"] = fen_inicial
+    _gravar_json(caminho, dados)
+
+    with pytest.raises(ValueError, match=r"fen_inicial.*texto") as erro:
+        EstadoPartida.carregar(str(caminho))
+
+    assert str(caminho) in str(erro.value)
+
+
 @pytest.mark.parametrize("valor", [-1, True, 1.5, "900000", None, [], {}])
 @pytest.mark.parametrize("campo", ["meu_ms", "adversario_ms", "incremento_ms"])
 def test_carregar_relogio_com_tipo_ou_valor_invalido(tmp_path, campo, valor):
@@ -299,6 +332,25 @@ def test_carregar_historico_com_tipo_invalido(tmp_path):
     _gravar_json(caminho, dados)
 
     with pytest.raises(ValueError, match="Arquivo de partida com dados inválidos"):
+        EstadoPartida.carregar(str(caminho))
+
+
+def test_carregar_conteudo_principal_que_nao_e_objeto(tmp_path):
+    caminho = tmp_path / "conteudo-nao-objeto.json"
+    caminho.write_text("[]", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"conteúdo deve ser um objeto JSON") as erro:
+        EstadoPartida.carregar(str(caminho))
+
+    assert str(caminho) in str(erro.value)
+
+
+def test_carregar_historico_com_lance_que_nao_e_texto(tmp_path):
+    caminho, dados = _criar_json_valido(tmp_path)
+    dados["lances_uci"] = ["e2e4", 5]
+    _gravar_json(caminho, dados)
+
+    with pytest.raises(ValueError, match=r"lance do histórico deve ser um texto UCI"):
         EstadoPartida.carregar(str(caminho))
 
 
@@ -355,7 +407,6 @@ def test_salvar_rejeita_estrutura_de_relogio_invalida(tmp_path, relogio):
 @pytest.mark.parametrize(
     ("campo", "valor"),
     [
-        ("meu_ms", -1),
         ("meu_ms", True),
         ("adversario_ms", 1.5),
         ("adversario_ms", "100"),
@@ -380,6 +431,52 @@ def test_salvar_rejeita_relogio_invalido_antes_de_abrir_temporario(
         with pytest.raises(ValueError, match=f"relogio\\.{campo}"):
             estado.salvar(str(caminho))
 
+    assert caminho.read_text(encoding="utf-8") == conteudo_anterior
+    assert not temporario.exists()
+
+
+def test_salvar_grava_zero_para_tempos_negativos_sem_alterar_relogio(tmp_path):
+    """Limita os valores persistidos a zero sem modificar o relógio em memória."""
+    caminho = tmp_path / "estado.json"
+    relogio = EstadoRelogio(meu_ms=-1, adversario_ms=-2, incremento_ms=-3)
+    estado = EstadoPartida(
+        tabuleiro=chess.Board(), minha_cor=chess.WHITE, relogio=relogio
+    )
+
+    estado.salvar(str(caminho))
+    dados = json.loads(caminho.read_text(encoding="utf-8"))
+
+    assert dados["relogio"] == {
+        "meu_ms": 0,
+        "adversario_ms": 0,
+        "incremento_ms": 0,
+    }
+    assert estado.relogio.meu_ms == -1
+    assert estado.relogio.adversario_ms == -2
+    assert estado.relogio.incremento_ms == -3
+
+
+def test_salvar_posicao_raiz_invalida_preserva_arquivo_sem_abrir_temporario(
+    tmp_path,
+):
+    """Rejeita a posição inicial antes de abrir o temporário e preserva o destino."""
+    caminho = tmp_path / "estado.json"
+    temporario = Path(f"{caminho}.tmp")
+    conteudo_anterior = "DADOS_ANTIGOS_IMPORTANTES"
+    caminho.write_text(conteudo_anterior, encoding="utf-8")
+    estado = EstadoPartida(
+        tabuleiro=chess.Board("8/8/8/8/8/8/8/8 w - - 0 1"),
+        minha_cor=chess.WHITE,
+        relogio=EstadoRelogio(0, 0, 0),
+    )
+
+    with patch(
+        "builtins.open", side_effect=AssertionError("abriu o temporário")
+    ) as abrir:
+        with pytest.raises(ValueError, match="posição inicial é inválida"):
+            estado.salvar(str(caminho))
+
+    abrir.assert_not_called()
     assert caminho.read_text(encoding="utf-8") == conteudo_anterior
     assert not temporario.exists()
 
