@@ -44,6 +44,8 @@ class EstadoPartida:
     def salvar(self, caminho: str) -> None:
         """Salva o estado em JSON atômico.
 
+        Tempos negativos do relógio são gravados como 0; o objeto em memória não é alterado.
+
         Raises:
             ValueError: se a cor, os tempos ou a posição inicial forem inválidos.
             OSError: se não for possível gravar ou substituir o arquivo.
