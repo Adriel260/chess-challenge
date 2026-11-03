@@ -1,6 +1,9 @@
 """Testes do módulo de motor (MotorFalso, testes unitários com mock e integração com Stockfish)."""
 
 import os
+import sys
+import threading
+import time
 from unittest.mock import MagicMock, patch
 import pytest
 import chess
@@ -119,7 +122,7 @@ def test_motor_falso_gerenciador_contexto_e_fechamento() -> None:
 
 
 def test_motor_uci_unitario_conversao_e_mate() -> None:
-    # Teste unitário para validar conversão de mate e centipeões sem depender de binário externo
+    # Teste unitário para validar conversão de mate, centipeões e passagem de multipv
     mock_engine = MagicMock()
     lance = chess.Move.from_uci("e1e8")
     mock_info = {
@@ -131,11 +134,12 @@ def test_motor_uci_unitario_conversao_e_mate() -> None:
     mock_engine.analyse.return_value = [mock_info]
 
     with patch("chess.engine.SimpleEngine.popen_uci", return_value=mock_engine):
-        motor = Motor("dummy_path", multipv=1)
+        motor = Motor("dummy_path", multipv=3)
         tabuleiro = chess.Board("6k1/5ppp/8/8/8/8/5PPP/4Q1K1 w - - 0 1")
         orcamento = Orcamento(soft_s=0.5, hard_s=1.0)
         resultado = motor.analisar(tabuleiro, orcamento)
 
+        assert mock_engine.analyse.call_args.kwargs["multipv"] == 3
         assert len(resultado.candidatos) == 1
         candidato = resultado.candidatos[0]
         assert candidato.lance == lance
@@ -174,6 +178,7 @@ def test_motor_uci_unitario_avaliacao_vez_das_pretas_e_mate_sofrido() -> None:
         orcamento = Orcamento(soft_s=0.5, hard_s=1.0)
         resultado = motor.analisar(tabuleiro, orcamento)
 
+        assert mock_engine.analyse.call_args.kwargs["multipv"] == 2
         assert len(resultado.candidatos) == 2
         assert resultado.candidatos[0].centipeoes == 80
         assert resultado.candidatos[0].mate is None
@@ -229,9 +234,14 @@ def test_motor_uci_unitario_imposicao_hard_s_em_qualquer_relacao() -> None:
 
 
 def test_motor_uci_unitario_reabertura_apos_queda() -> None:
-    # Teste unitário para validar tolerância a EngineTerminatedError com reabertura
+    # Valida tolerância a EngineTerminatedError descontando o tempo gasto antes da queda
     mock_engine1 = MagicMock()
-    mock_engine1.analyse.side_effect = chess.engine.EngineTerminatedError("Motor caiu")
+
+    def _falhar_apos_atraso(*_args: object, **_kwargs: object) -> None:
+        time.sleep(0.2)
+        raise chess.engine.EngineTerminatedError("Motor caiu")
+
+    mock_engine1.analyse.side_effect = _falhar_apos_atraso
 
     mock_engine2 = MagicMock()
     lance = chess.Move.from_uci("e2e4")
@@ -243,18 +253,73 @@ def test_motor_uci_unitario_reabertura_apos_queda() -> None:
     }
     mock_engine2.analyse.return_value = [mock_info]
 
-    with patch("chess.engine.SimpleEngine.popen_uci", side_effect=[mock_engine1, mock_engine2]):
+    with patch("chess.engine.SimpleEngine.popen_uci", side_effect=[mock_engine1, mock_engine2]) as mock_popen:
         motor = Motor("dummy_path")
         tabuleiro = chess.Board()
-        orcamento = Orcamento(soft_s=0.5, hard_s=1.0)
+        orcamento = Orcamento(soft_s=0.3, hard_s=0.5)
         resultado = motor.analisar(tabuleiro, orcamento)
 
         assert len(resultado.candidatos) == 1
         assert resultado.candidatos[0].lance == lance
         assert resultado.candidatos[0].centipeoes == 25
         assert resultado.candidatos[0].mate is None
+        assert resultado.tempo_gasto_s >= 0.2
+
+        # Verifica que popen_uci na reabertura recebeu timeout limitado ao restante
+        timeout_reabertura = mock_popen.call_args_list[1].kwargs.get("timeout")
+        assert timeout_reabertura is not None
+        assert timeout_reabertura <= 0.5 - 0.2 + 0.05
+
+        # Verifica que na 2ª tentativa limit.time + timeout respeita o restante
+        args2, _ = mock_engine2.analyse.call_args
+        limit_usado2 = args2[1]
+        assert limit_usado2.time + mock_engine2.timeout <= 0.5 - 0.2 + 1e-9
+
         mock_engine1.close.assert_called_once()
+        mock_engine2.ping.assert_called_once()
         motor.fechar()
+
+
+def test_motor_uci_unitario_queda_sem_orcamento_para_reabrir_propaga_erro_original() -> None:
+    # Caso 1: Queda após estourar hard_s (0.25s gastos com hard_s=0.2)
+    mock_engine1 = MagicMock()
+
+    def _queda_apos_estouro(*_args: object, **_kwargs: object) -> None:
+        time.sleep(0.25)
+        raise chess.engine.EngineTerminatedError("Queda após estouro")
+
+    mock_engine1.analyse.side_effect = _queda_apos_estouro
+
+    with patch("chess.engine.SimpleEngine.popen_uci", return_value=mock_engine1) as mock_popen:
+        motor = Motor("dummy_path")
+        tabuleiro = chess.Board()
+        orcamento = Orcamento(soft_s=0.1, hard_s=0.2)
+
+        with pytest.raises(chess.engine.EngineTerminatedError):
+            motor.analisar(tabuleiro, orcamento)
+
+        assert mock_popen.call_count == 1
+        assert motor._engine is None
+
+    # Caso 2: Queda sobrando menos que ESTIMATIVA_REABERTURA_S (0.32s gastos com hard_s=0.4)
+    mock_engine_curto = MagicMock()
+
+    def _queda_orcamento_curto(*_args: object, **_kwargs: object) -> None:
+        time.sleep(0.32)
+        raise chess.engine.EngineTerminatedError("Queda com pouco tempo restante")
+
+    mock_engine_curto.analyse.side_effect = _queda_orcamento_curto
+
+    with patch("chess.engine.SimpleEngine.popen_uci", return_value=mock_engine_curto) as mock_popen_curto:
+        motor2 = Motor("dummy_path")
+        tabuleiro = chess.Board()
+        orcamento_curto = Orcamento(soft_s=0.3, hard_s=0.4)
+
+        with pytest.raises(chess.engine.EngineTerminatedError):
+            motor2.analisar(tabuleiro, orcamento_curto)
+
+        assert mock_popen_curto.call_count == 1
+        assert motor2._engine is None
 
 
 def test_motor_uci_unitario_queda_dupla_propaga_erro() -> None:
@@ -277,7 +342,7 @@ def test_motor_uci_unitario_queda_dupla_propaga_erro() -> None:
         assert motor._engine is None
 
 
-def test_motor_uci_unitario_dict_unico_e_descarte_sem_score_ou_pv() -> None:
+def test_motor_uci_unitario_descarte_sem_score_ou_pv_e_erro_sem_candidatos() -> None:
     mock_engine = MagicMock()
     lance_valido = chess.Move.from_uci("d2d4")
     lance_sem_score = chess.Move.from_uci("e2e4")
@@ -304,16 +369,14 @@ def test_motor_uci_unitario_dict_unico_e_descarte_sem_score_ou_pv() -> None:
         assert resultado.candidatos[0].lance == lance_valido
         assert resultado.candidatos[0].centipeoes == 30
 
-        # Testa retorno como dict único (quando multipv=1 em certas versões)
-        mock_engine.analyse.return_value = {
-            "pv": [lance_valido],
-            "depth": 7,
-            "nodes": 150,
-            "score": chess.engine.PovScore(chess.engine.Cp(40), chess.WHITE),
-        }
-        resultado_dict = motor.analisar(tabuleiro, orcamento)
-        assert len(resultado_dict.candidatos) == 1
-        assert resultado_dict.candidatos[0].centipeoes == 40
+        # Quando nenhuma linha possui pv e score válidos, deve levantar EngineError
+        mock_engine.analyse.return_value = [
+            {"depth": 5, "nodes": 50},
+            {"pv": [], "depth": 5, "nodes": 50, "score": chess.engine.PovScore(chess.engine.Cp(10), chess.WHITE)},
+        ]
+        with pytest.raises(chess.engine.EngineError):
+            motor.analisar(tabuleiro, orcamento)
+
         motor.fechar()
 
 
@@ -327,13 +390,14 @@ def test_motor_uci_unitario_configure_falha_fecha_processo_e_timeout_nao_repete(
             Motor("dummy_path", threads=2, hash_mb=128)
         mock_engine_falho.close.assert_called_once()
 
-    # Verifica configure normal, TimeoutError sem repetir busca e bloqueio após fechar()
+    # Verifica configure + ping normal, TimeoutError sem repetir busca e bloqueio após fechar()
     mock_engine_ok = MagicMock()
     mock_engine_ok.analyse.side_effect = TimeoutError("Estourou tempo")
 
     with patch("chess.engine.SimpleEngine.popen_uci", return_value=mock_engine_ok) as mock_popen:
         motor = Motor("dummy_path", threads=2, hash_mb=256)
         mock_engine_ok.configure.assert_called_once_with({"Threads": 2, "Hash": 256})
+        mock_engine_ok.ping.assert_called_once()
 
         tabuleiro = chess.Board()
         orcamento = Orcamento(soft_s=0.2, hard_s=0.5)
@@ -349,6 +413,49 @@ def test_motor_uci_unitario_configure_falha_fecha_processo_e_timeout_nao_repete(
         motor.fechar()
         with pytest.raises(RuntimeError):
             motor.analisar(tabuleiro, orcamento)
+
+
+def test_motor_uci_unitario_timeout_encerra_thread_de_fundo(capsys: pytest.CaptureFixture[str]) -> None:
+    codigo_motor_travado = (
+        "import sys, time\n"
+        "for linha in sys.stdin:\n"
+        "    cmd = linha.strip()\n"
+        "    if cmd == 'uci':\n"
+        "        print('id name MotorTravado', flush=True)\n"
+        "        print('option name Threads type spin default 1 min 1 max 512', flush=True)\n"
+        "        print('option name Hash type spin default 16 min 1 max 33554432', flush=True)\n"
+        "        print('option name MultiPV type spin default 1 min 1 max 500', flush=True)\n"
+        "        print('uciok', flush=True)\n"
+        "    elif cmd == 'isready':\n"
+        "        print('readyok', flush=True)\n"
+        "    elif cmd.startswith('go'):\n"
+        "        time.sleep(10)\n"
+        "    elif cmd == 'quit':\n"
+        "        break\n"
+    )
+    comando = [sys.executable, "-u", "-c", codigo_motor_travado]
+    motor = Motor(comando, threads=1, hash_mb=16, multipv=1)
+    tabuleiro = chess.Board()
+
+    with pytest.raises(TimeoutError):
+        motor.analisar(tabuleiro, Orcamento(soft_s=0.05, hard_s=0.1))
+
+    motor.fechar()
+
+    prazo = time.perf_counter() + 1.0
+    threads_engine: list[threading.Thread] = []
+    while time.perf_counter() < prazo:
+        threads_engine = [
+            t for t in threading.enumerate()
+            if t.is_alive() and "SimpleEngine" in t.name
+        ]
+        if not threads_engine:
+            break
+        time.sleep(0.02)
+
+    assert not threads_engine
+    capturado = capsys.readouterr()
+    assert "InvalidStateError" not in capturado.err
 
 
 @pytest.mark.integracao
@@ -401,7 +508,7 @@ def test_motor_real_respeita_hard_s() -> None:
 def test_motor_real_reabertura_apos_queda() -> None:
     with Motor(CAMINHO_STOCKFISH, multipv=2) as motor:
         tabuleiro = chess.Board()
-        orcamento = Orcamento(soft_s=0.1, hard_s=0.3)
+        orcamento = Orcamento(soft_s=0.1, hard_s=3.0)
 
         # Encerra propositalmente o processo do motor
         assert motor._engine is not None
